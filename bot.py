@@ -64,7 +64,6 @@ def make_call(phone):
             twiml=f"<Response><Say voice='alice'>Please hold while we connect you.</Say><Dial>{NEXFIELD_NUMBER}</Dial></Response>"
         )
         logger.info(f"Звонок на {phone} — SID: {call.sid}")
-        # Сохраняем связку SID → номер клиента в Redis
         redis_set(f"call:{call.sid}", phone, ex=86400)
         redis_set(f"latest_lead", phone, ex=86400)
         logger.info(f"Сохранено в Redis: call:{call.sid} = {phone}")
@@ -87,7 +86,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info(f"Найден номер: {phone}")
-    await update.message.reply_text(f"📞 Звоню на {phone} через {CALL_DELAY // 60} мин...")
+    await update.message.reply_text(f"Звоню на {phone} через {CALL_DELAY // 60} мин...")
 
     threading.Thread(target=make_call, args=(phone,), daemon=True).start()
 
@@ -98,4 +97,4 @@ if __name__ == "__main__":
     logger.info("Бот запущен")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL, handle_message))
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
