@@ -261,7 +261,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text
-    logger.info(f"Получено: {text[:80]}")
+    logger.info(f"Получено: {text[:80]} | chat_id: {update.message.chat_id}")
 
     phone = extract_phone(text)
     if not phone:
