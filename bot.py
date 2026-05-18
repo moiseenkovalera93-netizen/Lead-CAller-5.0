@@ -97,11 +97,9 @@ def next_business_time():
     """Возвращает datetime ближайшего рабочего времени (BUSINESS_START в Сакраменто)."""
     now = datetime.now(TIMEZONE)
     callback = now.replace(hour=BUSINESS_START, minute=0, second=0, microsecond=0)
-    # Если сейчас уже после рабочего дня — на завтра, иначе сегодня
     if now.hour >= BUSINESS_END:
         callback = callback + timedelta(days=1)
     elif now.hour >= BUSINESS_START:
-        # В пределах рабочего времени — следующее рабочее = прямо сейчас (но эту функцию вызываем только в нерабочее)
         callback = now
     return callback
 
@@ -180,7 +178,6 @@ def handle_failed_call(phone, attempts):
 # ЗВОНОК
 # =========================
 def make_call(phone, force=False):
-    # Сначала проверяем рабочее время — до любых задержек
     if not force and not is_business_hours():
         logger.info(f"Нерабочее время — создаю задачу перезвонить на {phone}")
         create_calendar_event(phone, hours_from_now=1, title=f"Call {phone}")
@@ -285,6 +282,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = extract_phone(text)
     if not phone:
         logger.info("Номер не найден")
+        return
+
+    # Защита от звонков на свои собственные номера (анти-цикл)
+    if phone in [TWILIO_FROM, NEXFIELD_NUMBER]:
+        logger.info(f"Игнорирую свой собственный номер: {phone}")
         return
 
     if is_blacklisted(phone):
