@@ -23,7 +23,6 @@ NEXFIELD_NUMBER    = os.getenv("NEXFIELD_NUMBER")
 UPSTASH_URL        = os.getenv("UPSTASH_URL")
 UPSTASH_TOKEN      = os.getenv("UPSTASH_TOKEN")
 
-# Задержка 45 секунд перед звонком
 CALL_DELAY = int(os.getenv("CALL_DELAY", "45"))
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -113,11 +112,11 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     phone = extract_phone(context.args[0])
     if not phone:
-        await update.message.reply_text(f"Неверный формат номера")
+        await update.message.reply_text("Неверный формат номера")
         return
     redis_set(f"blacklist:{phone}", "1", ex=365*24*3600)
     await update.message.reply_text(f"Номер {phone} добавлен в черный список")
-    logger.info(f"Blacklist: {phone}")
+    logger.info(f"Blacklist добавлен: {phone}")
 
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -154,11 +153,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_blacklisted(phone):
-        logger.info(f"Номер {phone} в черном списке — пропускаю")
+        logger.info(f"Номер {phone} в черном списке")
+        await update.message.reply_text(f"Номер {phone} в черном списке — звонок отменён")
         return
 
     if is_duplicate(phone):
-        logger.info(f"Уже звонили на {phone} сегодня — пропускаю")
+        logger.info(f"Дубль: {phone}")
+        await update.message.reply_text(f"Дубль — уже звонили на {phone} сегодня")
         return
 
     logger.info(f"Найден номер: {phone}")
