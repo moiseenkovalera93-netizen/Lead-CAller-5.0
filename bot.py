@@ -194,7 +194,7 @@ def make_call(phone, force=False):
         call = twilio_client.calls.create(
             to=phone,
             from_=TWILIO_FROM,
-            twiml=f"<Response><Say voice='alice'>Please hold while we connect you.</Say><Dial>{NEXFIELD_NUMBER}</Dial></Response>"
+            twiml=f"<Response><Say voice='alice'>Please hold while we connect you.</Say><Dial callerId='{phone}'>{NEXFIELD_NUMBER}</Dial></Response>"
         )
         redis_set(f"latest_lead", phone, ex=86400)
         redis_set(f"called:{phone}", "1", ex=86400)
