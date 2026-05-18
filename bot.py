@@ -108,6 +108,20 @@ def extract_phone(text: str):
     return None
 
 # =========================
+# SMS
+# =========================
+def send_sms(phone):
+    try:
+        twilio_client.messages.create(
+            to=phone,
+            from_=TWILIO_FROM,
+            body="Hi! This is Lumix Laser Removal. We tried to reach you several times but couldn't connect. Please call us back at (916) 279-3113"
+        )
+        logger.info(f"SMS отправлено на {phone}")
+    except Exception as e:
+        logger.error(f"Ошибка SMS на {phone}: {e}")
+
+# =========================
 # GOOGLE CALENDAR через Zapier
 # =========================
 def create_calendar_event(phone, hours_from_now=2, title="Follow-up call"):
@@ -141,8 +155,8 @@ def create_calendar_event(phone, hours_from_now=2, title="Follow-up call"):
 def handle_failed_call(phone, attempts):
     logger.info(f"Неудачный звонок {phone}, попытка {attempts}/{MAX_ATTEMPTS}")
     if attempts >= MAX_ATTEMPTS:
-        logger.info(f"Все попытки исчерпаны для {phone}")
-        # SMS будет добавлен в Шаге 3
+        logger.info(f"Все попытки исчерпаны для {phone} — отправляю SMS")
+        send_sms(phone)
     else:
         create_calendar_event(
             phone,
@@ -158,7 +172,6 @@ def make_call(phone, force=False):
         logger.info(f"Жду {CALL_DELAY} сек перед звонком на {phone}")
         time.sleep(CALL_DELAY)
 
-    # Проверка рабочего времени
     if not is_business_hours():
         logger.info(f"Нерабочее время — создаю событие для {phone}")
         create_calendar_event(phone, hours_from_now=1, title=f"Call {phone}")
@@ -170,13 +183,11 @@ def make_call(phone, force=False):
             from_=TWILIO_FROM,
             twiml=f"<Response><Say voice='alice'>Please hold while we connect you.</Say><Dial>{NEXFIELD_NUMBER}</Dial></Response>"
         )
-
         redis_set(f"latest_lead", phone, ex=86400)
         redis_set(f"called:{phone}", "1", ex=86400)
         attempts = increment_attempts(phone)
         logger.info(f"Звонок на {phone} — SID: {call.sid} — попытка {attempts}")
 
-        # Ждём завершения и проверяем статус
         time.sleep(60)
         call_status = twilio_client.calls(call.sid).fetch().status
         logger.info(f"Статус звонка {phone}: {call_status}")
@@ -192,7 +203,6 @@ def make_call(phone, force=False):
 # КОМАНДЫ
 # =========================
 async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принудительный звонок игнорируя дубль и blacklist"""
     if not context.args:
         await update.message.reply_text("Использование: /call +19161234567")
         return
@@ -204,7 +214,6 @@ async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
     threading.Thread(target=make_call, args=(phone, True), daemon=True).start()
 
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Заблокировать номер"""
     if not context.args:
         await update.message.reply_text("Использование: /block +19161234567")
         return
@@ -216,7 +225,6 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Номер {phone} заблокирован")
 
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Разблокировать номер"""
     if not context.args:
         await update.message.reply_text("Использование: /unblock +19161234567")
         return
@@ -228,7 +236,6 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Номер {phone} разблокирован")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статус системы"""
     latest = redis_get("latest_lead")
     now = datetime.now(TIMEZONE)
     working = "Да" if is_business_hours() else "Нет"
@@ -243,7 +250,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список команд"""
     await update.message.reply_text(
         "Команды:\n\n"
         "/call +19161234567 — принудительный звонок\n"
