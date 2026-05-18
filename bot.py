@@ -93,6 +93,18 @@ def is_business_hours():
     now = datetime.now(TIMEZONE)
     return BUSINESS_START <= now.hour < BUSINESS_END
 
+def next_business_time():
+    """Возвращает datetime ближайшего рабочего времени (BUSINESS_START в Сакраменто)."""
+    now = datetime.now(TIMEZONE)
+    callback = now.replace(hour=BUSINESS_START, minute=0, second=0, microsecond=0)
+    # Если сейчас уже после рабочего дня — на завтра, иначе сегодня
+    if now.hour >= BUSINESS_END:
+        callback = callback + timedelta(days=1)
+    elif now.hour >= BUSINESS_START:
+        # В пределах рабочего времени — следующее рабочее = прямо сейчас (но эту функцию вызываем только в нерабочее)
+        callback = now
+    return callback
+
 # =========================
 # ОПРЕДЕЛЕНИЕ НОМЕРА
 # =========================
@@ -168,14 +180,15 @@ def handle_failed_call(phone, attempts):
 # ЗВОНОК
 # =========================
 def make_call(phone, force=False):
+    # Сначала проверяем рабочее время — до любых задержек
+    if not force and not is_business_hours():
+        logger.info(f"Нерабочее время — создаю задачу перезвонить на {phone}")
+        create_calendar_event(phone, hours_from_now=1, title=f"Call {phone}")
+        return
+
     if not force:
         logger.info(f"Жду {CALL_DELAY} сек перед звонком на {phone}")
         time.sleep(CALL_DELAY)
-
-    if not is_business_hours():
-        logger.info(f"Нерабочее время — создаю событие для {phone}")
-        create_calendar_event(phone, hours_from_now=1, title=f"Call {phone}")
-        return
 
     try:
         call = twilio_client.calls.create(
@@ -285,7 +298,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info(f"Найден номер: {phone}")
-    await update.message.reply_text(f"Звоню на {phone} через {CALL_DELAY} сек...")
+    if is_business_hours():
+        await update.message.reply_text(f"Звоню на {phone} через {CALL_DELAY} сек...")
+    else:
+        callback_time = next_business_time()
+        await update.message.reply_text(
+            f"Нерабочее время — создаю задачу перезвонить на {phone} "
+            f"в {callback_time.strftime('%H:%M %d.%m')}"
+        )
     threading.Thread(target=make_call, args=(phone, False), daemon=True).start()
 
 # =========================
