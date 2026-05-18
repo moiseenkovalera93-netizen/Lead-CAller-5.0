@@ -188,10 +188,13 @@ def make_call(phone, force=False):
         time.sleep(CALL_DELAY)
 
     try:
+        # ИЗМЕНЕНО: добавлен record='record-from-ringing-dual' в <Dial>
+        # Запись стартует с момента дозвона до Nexfield, обе стороны на отдельных дорожках.
+        # Записи доступны в Twilio Console → Call SID → Recordings (хранятся 1 год).
         call = twilio_client.calls.create(
             to=phone,
             from_=TWILIO_FROM,
-            twiml=f"<Response><Say voice='alice'>Please hold while we connect you.</Say><Dial callerId='{phone}'>{NEXFIELD_NUMBER}</Dial></Response>"
+            twiml=f"<Response><Say voice='alice'>Please hold while we connect you. This call may be recorded for quality.</Say><Dial callerId='{phone}' record='record-from-ringing-dual'>{NEXFIELD_NUMBER}</Dial></Response>"
         )
         redis_set(f"latest_lead", phone, ex=86400)
         redis_set(f"called:{phone}", "1", ex=86400)
