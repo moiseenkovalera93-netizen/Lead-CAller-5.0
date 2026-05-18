@@ -5,6 +5,9 @@ import threading
 import time
 import requests
 import urllib.parse
+import json
+from datetime import datetime, timedelta
+import pytz
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from twilio.rest import Client
@@ -22,8 +25,14 @@ TWILIO_FROM        = os.getenv("TWILIO_FROM_NUMBER")
 NEXFIELD_NUMBER    = os.getenv("NEXFIELD_NUMBER")
 UPSTASH_URL        = os.getenv("UPSTASH_URL")
 UPSTASH_TOKEN      = os.getenv("UPSTASH_TOKEN")
+ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")
 
-CALL_DELAY = int(os.getenv("CALL_DELAY", "45"))
+CALL_DELAY     = int(os.getenv("CALL_DELAY", "45"))
+MAX_ATTEMPTS   = 3
+RETRY_HOURS    = 2
+BUSINESS_START = 9
+BUSINESS_END   = 20
+TIMEZONE       = pytz.timezone("America/Los_Angeles")
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -71,6 +80,19 @@ def is_blacklisted(phone):
 def is_duplicate(phone):
     return redis_get(f"called:{phone}") is not None
 
+def get_attempts(phone):
+    val = redis_get(f"attempts:{phone}")
+    return int(val) if val else 0
+
+def increment_attempts(phone):
+    attempts = get_attempts(phone) + 1
+    redis_set(f"attempts:{phone}", str(attempts), ex=86400)
+    return attempts
+
+def is_business_hours():
+    now = datetime.now(TIMEZONE)
+    return BUSINESS_START <= now.hour < BUSINESS_END
+
 # =========================
 # ОПРЕДЕЛЕНИЕ НОМЕРА
 # =========================
@@ -86,27 +108,103 @@ def extract_phone(text: str):
     return None
 
 # =========================
+# GOOGLE CALENDAR через Zapier
+# =========================
+def create_calendar_event(phone, hours_from_now=2, title="Follow-up call"):
+    if not ZAPIER_WEBHOOK_URL:
+        logger.warning("ZAPIER_WEBHOOK_URL не настроен")
+        return
+    try:
+        event_time = datetime.now(TIMEZONE) + timedelta(hours=hours_from_now)
+        if event_time.hour >= BUSINESS_END:
+            event_time = (event_time + timedelta(days=1)).replace(
+                hour=BUSINESS_START, minute=0, second=0, microsecond=0
+            )
+        elif event_time.hour < BUSINESS_START:
+            event_time = event_time.replace(
+                hour=BUSINESS_START, minute=0, second=0, microsecond=0
+            )
+        data = {
+            "phone": phone,
+            "title": title,
+            "time": event_time.isoformat(),
+            "description": phone
+        }
+        requests.post(ZAPIER_WEBHOOK_URL, json=data, timeout=5)
+        logger.info(f"Событие создано для {phone} на {event_time}")
+    except Exception as e:
+        logger.error(f"Ошибка создания события: {e}")
+
+# =========================
+# ОБРАБОТКА НЕУДАЧНОГО ЗВОНКА
+# =========================
+def handle_failed_call(phone, attempts):
+    logger.info(f"Неудачный звонок {phone}, попытка {attempts}/{MAX_ATTEMPTS}")
+    if attempts >= MAX_ATTEMPTS:
+        logger.info(f"Все попытки исчерпаны для {phone}")
+        # SMS будет добавлен в Шаге 3
+    else:
+        create_calendar_event(
+            phone,
+            hours_from_now=RETRY_HOURS,
+            title=f"Retry call {phone} attempt {attempts + 1}"
+        )
+
+# =========================
 # ЗВОНОК
 # =========================
-def make_call(phone):
-    logger.info(f"Жду {CALL_DELAY} сек перед звонком на {phone}")
-    time.sleep(CALL_DELAY)
+def make_call(phone, force=False):
+    if not force:
+        logger.info(f"Жду {CALL_DELAY} сек перед звонком на {phone}")
+        time.sleep(CALL_DELAY)
+
+    # Проверка рабочего времени
+    if not is_business_hours():
+        logger.info(f"Нерабочее время — создаю событие для {phone}")
+        create_calendar_event(phone, hours_from_now=1, title=f"Call {phone}")
+        return
+
     try:
         call = twilio_client.calls.create(
             to=phone,
             from_=TWILIO_FROM,
             twiml=f"<Response><Say voice='alice'>Please hold while we connect you.</Say><Dial>{NEXFIELD_NUMBER}</Dial></Response>"
         )
+
         redis_set(f"latest_lead", phone, ex=86400)
         redis_set(f"called:{phone}", "1", ex=86400)
-        logger.info(f"Звонок на {phone} — SID: {call.sid}")
+        attempts = increment_attempts(phone)
+        logger.info(f"Звонок на {phone} — SID: {call.sid} — попытка {attempts}")
+
+        # Ждём завершения и проверяем статус
+        time.sleep(60)
+        call_status = twilio_client.calls(call.sid).fetch().status
+        logger.info(f"Статус звонка {phone}: {call_status}")
+
+        if call_status in ["busy", "no-answer", "failed"]:
+            handle_failed_call(phone, attempts)
+
     except Exception as e:
         logger.error(f"Ошибка звонка на {phone}: {e}")
+        handle_failed_call(phone, get_attempts(phone))
 
 # =========================
 # КОМАНДЫ
 # =========================
+async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительный звонок игнорируя дубль и blacklist"""
+    if not context.args:
+        await update.message.reply_text("Использование: /call +19161234567")
+        return
+    phone = extract_phone(context.args[0])
+    if not phone:
+        await update.message.reply_text("Неверный формат номера")
+        return
+    await update.message.reply_text(f"Принудительный звонок на {phone}...")
+    threading.Thread(target=make_call, args=(phone, True), daemon=True).start()
+
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заблокировать номер"""
     if not context.args:
         await update.message.reply_text("Использование: /block +19161234567")
         return
@@ -115,10 +213,10 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Неверный формат номера")
         return
     redis_set(f"blacklist:{phone}", "1", ex=365*24*3600)
-    await update.message.reply_text(f"Номер {phone} добавлен в черный список")
-    logger.info(f"Blacklist добавлен: {phone}")
+    await update.message.reply_text(f"Номер {phone} заблокирован")
 
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разблокировать номер"""
     if not context.args:
         await update.message.reply_text("Использование: /unblock +19161234567")
         return
@@ -127,14 +225,32 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Неверный формат номера")
         return
     redis_delete(f"blacklist:{phone}")
-    await update.message.reply_text(f"Номер {phone} убран из черного списка")
+    await update.message.reply_text(f"Номер {phone} разблокирован")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статус системы"""
     latest = redis_get("latest_lead")
+    now = datetime.now(TIMEZONE)
+    working = "Да" if is_business_hours() else "Нет"
     await update.message.reply_text(
         f"Система активна\n"
         f"Задержка: {CALL_DELAY} сек\n"
+        f"Рабочее время: {working} ({BUSINESS_START}:00-{BUSINESS_END}:00 PT)\n"
+        f"Макс. попыток: {MAX_ATTEMPTS}\n"
+        f"Повтор через: {RETRY_HOURS} ч\n"
+        f"Время сейчас: {now.strftime('%H:%M PT')}\n"
         f"Последний лид: {latest or 'нет'}"
+    )
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список команд"""
+    await update.message.reply_text(
+        "Команды:\n\n"
+        "/call +19161234567 — принудительный звонок\n"
+        "/block +19161234567 — заблокировать номер\n"
+        "/unblock +19161234567 — разблокировать номер\n"
+        "/status — статус системы\n"
+        "/help — эта справка"
     )
 
 # =========================
@@ -164,7 +280,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Найден номер: {phone}")
     await update.message.reply_text(f"Звоню на {phone} через {CALL_DELAY} сек...")
-    threading.Thread(target=make_call, args=(phone,), daemon=True).start()
+    threading.Thread(target=make_call, args=(phone, False), daemon=True).start()
 
 # =========================
 # ЗАПУСК
@@ -172,8 +288,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     logger.info("Бот запущен")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("call", cmd_call))
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.ALL, handle_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
