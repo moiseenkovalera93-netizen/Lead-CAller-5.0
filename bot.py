@@ -8,6 +8,7 @@ import urllib.parse
 import json
 from datetime import datetime, timedelta
 import pytz
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from twilio.rest import Client
@@ -26,6 +27,9 @@ NEXFIELD_NUMBER    = os.getenv("NEXFIELD_NUMBER")
 UPSTASH_URL        = os.getenv("UPSTASH_URL")
 UPSTASH_TOKEN      = os.getenv("UPSTASH_TOKEN")
 ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")
+CHAT_ID            = os.getenv("CHAT_ID", "")
+PUBLIC_URL         = os.getenv("PUBLIC_URL", "")
+PORT               = int(os.getenv("PORT", "8080"))
 
 CALL_DELAY     = int(os.getenv("CALL_DELAY", "45"))
 MAX_ATTEMPTS   = 3
@@ -35,6 +39,24 @@ BUSINESS_END   = 20
 TIMEZONE       = pytz.timezone("America/Los_Angeles")
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+flask_app = Flask(__name__)
+
+
+# =========================
+# TELEGRAM SEND (синхронно через HTTP — для использования из Flask)
+# =========================
+def send_telegram(text, chat_id=None):
+    target = chat_id or CHAT_ID
+    if not target or not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": target, "text": text},
+            timeout=5,
+        )
+    except Exception as e:
+        logger.error(f"Telegram send error: {e}")
 
 # =========================
 # UPSTASH REDIS
@@ -128,6 +150,7 @@ def send_sms(phone):
             body="Hi! This is Lumix Laser Removal. We tried to reach you several times but couldn't connect. Please call us back at (916) 279-3113"
         )
         logger.info(f"SMS отправлено на {phone}")
+        send_telegram(f"📱 SMS-фолбэк отправлен на {phone} (3 попытки исчерпаны)")
     except Exception as e:
         logger.error(f"Ошибка SMS на {phone}: {e}")
 
@@ -177,7 +200,7 @@ def handle_failed_call(phone, attempts):
 # =========================
 # ЗВОНОК
 # =========================
-def make_call(phone, force=False):
+def make_call(phone, force=False, chat_id=None):
     if not force and not is_business_hours():
         logger.info(f"Нерабочее время — создаю задачу перезвонить на {phone}")
         create_calendar_event(phone, hours_from_now=1, title=f"Call {phone}")
@@ -188,18 +211,27 @@ def make_call(phone, force=False):
         time.sleep(CALL_DELAY)
 
     try:
-        # ИЗМЕНЕНО: добавлен record='record-from-ringing-dual' в <Dial>
-        # Запись стартует с момента дозвона до Nexfield, обе стороны на отдельных дорожках.
-        # Записи доступны в Twilio Console → Call SID → Recordings (хранятся 1 год).
-        call = twilio_client.calls.create(
-            to=phone,
-            from_=TWILIO_FROM,
-            twiml=f"<Response><Say voice='alice'>Please hold while we connect you. This call may be recorded for quality.</Say><Dial callerId='{phone}' record='record-from-ringing-dual'>{NEXFIELD_NUMBER}</Dial></Response>"
-        )
-        redis_set(f"latest_lead", phone, ex=86400)
+        call_params = {
+            "to": phone,
+            "from_": TWILIO_FROM,
+            "twiml": f"<Response><Say voice='alice'>Please hold while we connect you. This call may be recorded for quality.</Say><Dial callerId='{phone}' record='record-from-ringing-dual'>{NEXFIELD_NUMBER}</Dial></Response>",
+        }
+        if PUBLIC_URL:
+            call_params["status_callback"] = f"{PUBLIC_URL.rstrip('/')}/twilio/status"
+            call_params["status_callback_event"] = ["completed"]
+            call_params["status_callback_method"] = "POST"
+
+        call = twilio_client.calls.create(**call_params)
+
+        redis_set("latest_lead", phone, ex=86400)
         redis_set(f"called:{phone}", "1", ex=86400)
+        redis_set(f"call_to:{call.sid}", phone, ex=86400)
+        if chat_id:
+            redis_set(f"call_chat:{call.sid}", str(chat_id), ex=86400)
+
         attempts = increment_attempts(phone)
         logger.info(f"Звонок на {phone} — SID: {call.sid} — попытка {attempts}")
+        send_telegram(f"📞 Набираю {phone} (попытка {attempts}/{MAX_ATTEMPTS})", chat_id=chat_id)
 
         time.sleep(60)
         call_status = twilio_client.calls(call.sid).fetch().status
@@ -211,6 +243,48 @@ def make_call(phone, force=False):
     except Exception as e:
         logger.error(f"Ошибка звонка на {phone}: {e}")
         handle_failed_call(phone, get_attempts(phone))
+
+
+# =========================
+# FLASK: TWILIO STATUS CALLBACK
+# =========================
+@flask_app.route("/twilio/status", methods=["POST"])
+def twilio_status():
+    data = request.form.to_dict()
+    call_sid = data.get("CallSid", "")
+    status = data.get("CallStatus", "")
+    to_number = data.get("To", "") or redis_get(f"call_to:{call_sid}") or "?"
+    duration = data.get("CallDuration", "0")
+    chat_id = redis_get(f"call_chat:{call_sid}") or CHAT_ID
+
+    msg = None
+    if status == "completed":
+        try:
+            dur_int = int(duration)
+            if dur_int < 10:
+                msg = f"❓ {to_number} — звонок завершился ({dur_int} сек, скорее всего сбросили)"
+            else:
+                mins, secs = divmod(dur_int, 60)
+                msg = f"🏁 {to_number} — звонок завершён, длительность {mins}:{secs:02d}"
+        except Exception:
+            msg = f"🏁 {to_number} — звонок завершён"
+    elif status == "busy":
+        msg = f"📵 {to_number} — занято"
+    elif status == "no-answer":
+        msg = f"🔕 {to_number} — не отвечает"
+    elif status == "failed":
+        msg = f"❌ {to_number} — ошибка вызова"
+    elif status == "canceled":
+        msg = f"🚫 {to_number} — звонок отменён"
+
+    if msg:
+        send_telegram(msg, chat_id=chat_id)
+    return "", 200
+
+
+@flask_app.route("/", methods=["GET"])
+def health():
+    return "Lumix bot is running", 200
 
 # =========================
 # КОМАНДЫ
@@ -224,7 +298,8 @@ async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Неверный формат номера")
         return
     await update.message.reply_text(f"Принудительный звонок на {phone}...")
-    threading.Thread(target=make_call, args=(phone, True), daemon=True).start()
+    chat_id = update.message.chat_id
+    threading.Thread(target=make_call, args=(phone, True, chat_id), daemon=True).start()
 
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -259,7 +334,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Макс. попыток: {MAX_ATTEMPTS}\n"
         f"Повтор через: {RETRY_HOURS} ч\n"
         f"Время сейчас: {now.strftime('%H:%M PT')}\n"
-        f"Последний лид: {latest or 'нет'}"
+        f"Последний лид: {latest or 'нет'}\n"
+        f"PUBLIC_URL: {'есть' if PUBLIC_URL else 'НЕ настроен'}\n"
+        f"CHAT_ID: {'есть' if CHAT_ID else 'НЕ настроен'}"
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,7 +357,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text
-    logger.info(f"Получено: {text[:80]} | chat_id: {update.message.chat_id}")
+    chat_id = update.message.chat_id
+    logger.info(f"Получено: {text[:80]} | chat_id: {chat_id}")
 
     phone = extract_phone(text)
     if not phone:
@@ -311,12 +389,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Нерабочее время — создаю задачу перезвонить на {phone} "
             f"в {callback_time.strftime('%H:%M %d.%m')}"
         )
-    threading.Thread(target=make_call, args=(phone, False), daemon=True).start()
+    threading.Thread(target=make_call, args=(phone, False, chat_id), daemon=True).start()
+
+# =========================
+# FLASK В ОТДЕЛЬНОМ ПОТОКЕ
+# =========================
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 # =========================
 # ЗАПУСК
 # =========================
 if __name__ == "__main__":
+    logger.info(f"Запуск Flask на порту {PORT} для Twilio callbacks...")
+    threading.Thread(target=run_flask, daemon=True).start()
+
     logger.info("Бот запущен")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("call", cmd_call))
