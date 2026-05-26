@@ -216,7 +216,7 @@ def make_call(phone, force=False, chat_id=None):
             "from_": TWILIO_FROM,
             "twiml": (
                 f"<Response>"
-                f"<Dial callerId='{phone}' record='record-from-ringing-dual'>{NEXFIELD_NUMBER}</Dial>"
+                f"<Dial callerId='{phone}' answerOnBridge='true' record='record-from-ringing-dual'>{NEXFIELD_NUMBER}</Dial>"
                 f"</Response>"
             ),
         }
