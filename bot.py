@@ -216,7 +216,7 @@ def make_call(phone, force=False, chat_id=None):
             "from_": TWILIO_FROM,
             "twiml": (
                 f"<Response>"
-                f"<Play loop='0'>http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3</Play>"
+                f"<Say voice='Polly.Joanna'>Please hold.</Say>"
                 f"<Dial callerId='{phone}' record='record-from-ringing-dual'>{NEXFIELD_NUMBER}</Dial>"
                 f"</Response>"
             ),
