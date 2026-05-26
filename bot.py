@@ -212,9 +212,13 @@ def make_call(phone, force=False, chat_id=None):
 
     try:
         call_params = {
-            "to": phone,
+            "to": NEXFIELD_NUMBER,
             "from_": TWILIO_FROM,
-            "twiml": f"<Response><Say voice='alice'>Please hold while we connect you. This call may be recorded for quality.</Say><Dial callerId='{phone}' record='record-from-ringing-dual'>{NEXFIELD_NUMBER}</Dial></Response>",
+            "twiml": (
+                f"<Response>"
+                f"<Dial callerId='{TWILIO_FROM}' timeout='25' record='record-from-ringing-dual'>{phone}</Dial>"
+                f"</Response>"
+            ),
         }
         if PUBLIC_URL:
             call_params["status_callback"] = f"{PUBLIC_URL.rstrip('/')}/twilio/status"
@@ -253,7 +257,7 @@ def twilio_status():
     data = request.form.to_dict()
     call_sid = data.get("CallSid", "")
     status = data.get("CallStatus", "")
-    to_number = data.get("To", "") or redis_get(f"call_to:{call_sid}") or "?"
+    to_number = redis_get(f"call_to:{call_sid}") or data.get("To", "") or "?"
     duration = data.get("CallDuration", "0")
     chat_id = redis_get(f"call_chat:{call_sid}") or CHAT_ID
 
