@@ -212,11 +212,12 @@ def make_call(phone, force=False, chat_id=None):
 
     try:
         call_params = {
-            "to": NEXFIELD_NUMBER,
+            "to": phone,
             "from_": TWILIO_FROM,
             "twiml": (
                 f"<Response>"
-                f"<Dial callerId='{TWILIO_FROM}' timeout='25' record='record-from-ringing-dual'>{phone}</Dial>"
+                f"<Play loop='0'>http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3</Play>"
+                f"<Dial callerId='{phone}' record='record-from-ringing-dual'>{NEXFIELD_NUMBER}</Dial>"
                 f"</Response>"
             ),
         }
@@ -257,7 +258,7 @@ def twilio_status():
     data = request.form.to_dict()
     call_sid = data.get("CallSid", "")
     status = data.get("CallStatus", "")
-    to_number = redis_get(f"call_to:{call_sid}") or data.get("To", "") or "?"
+    to_number = data.get("To", "") or redis_get(f"call_to:{call_sid}") or "?"
     duration = data.get("CallDuration", "0")
     chat_id = redis_get(f"call_chat:{call_sid}") or CHAT_ID
 
